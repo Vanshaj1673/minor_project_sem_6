@@ -1,149 +1,114 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import os
 import pandas as pd
 import joblib
-from werkzeug.utils import secure_filename
-
-# For chatbot model
-import re
-import nltk
-from nltk.corpus import stopwords
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import LogisticRegression
-
-# ------------- Flask Setup ----------------
-UPLOAD_FOLDER = 'uploads'
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
 
 app = Flask(__name__)
 CORS(app)
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# ------------- Helper Function ----------------
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
-# ------------- Load ML Yield Model ----------------
 model = joblib.load('yield_model.pkl')
 crop_encoder = joblib.load('crop_encoder.pkl')
 soil_encoder = joblib.load('soil_encoder.pkl')
 
-# ------------- Load & Train Chatbot Model ----------------
-nltk.download('stopwords')
+question_flow = [
+    ("Crop_Type", "Enter Crop Type (e.g., Wheat, Rice, Corn):"),
+    ("Soil_Type", "Enter Soil Type (e.g., Sandy, Loamy, Peaty):"),
+    ("Soil_pH", "Enter Soil pH value (e.g., 5.5, 6.2):"),
+    ("Temperature", "Enter Temperature (°C):"),
+    ("Humidity", "Enter Humidity (%):"),
+    ("Wind_Speed", "Enter Wind Speed (km/h):"),
+    ("N", "Enter Nitrogen (N) level:"),
+    ("P", "Enter Phosphorus (P) level:"),
+    ("K", "Enter Potassium (K) level:"),
+    ("Soil_Quality", "Enter Soil Quality Score:")
+]
 
-def preprocess_text(text):
-    text = re.sub(r'\W', ' ', text)
-    text = text.lower()
-    stop_words = set(stopwords.words('english'))
-    return ' '.join([word for word in text.split() if word not in stop_words])
+user_sessions = {}
 
-# Load chatbot dataset
-df = pd.read_csv(r'../datasets/crop_yield_dataset.csv')
-df['symptoms'] = df.iloc[:, 1:].apply(lambda row: ' '.join(row.dropna().astype(str)), axis=1)
-df_cleaned = df[[df.columns[0], 'symptoms']].copy()
-df_cleaned.columns = ['diagnosis', 'symptoms']
-df_cleaned['symptoms'] = df_cleaned['symptoms'].apply(preprocess_text)
-
-# ✅ LIMIT dataset to 1000 rows for memory optimization
-df_cleaned = df_cleaned[:1000]
-
-# Train chatbot model
-X = df_cleaned['symptoms']
-y = df_cleaned['diagnosis']
-
-# ✅ Reduce max_features to 1000 to reduce RAM usage
-tfidf_vectorizer = TfidfVectorizer(max_features=1000)
-X_tfidf = tfidf_vectorizer.fit_transform(X)
-chatbot_model = LogisticRegression()
-chatbot_model.fit(X_tfidf, y)
-
-# ------------- Predefined Soil Info ----------------
-initial_info = (
-    "The soil in this region is rich in nitrogen and potassium, ideal for wheat and barley. "
-    "Ensure the pH remains between 6.0 and 7.5 for optimal crop yield. Regular composting and "
-    "monitoring of micronutrients like zinc and magnesium is also recommended."
-)
-
-# ------------- Predict Yield ----------------
-@app.route('/predict_yield', methods=['POST'])
-def predict_yield():
-    data = request.json
-    try:
-        crop = data['Crop_Type']
-        soil = data['Soil_Type']
-
-        crop_encoded = crop_encoder.transform([crop])[0]
-        soil_encoded = soil_encoder.transform([soil])[0]
-
-        input_features = [
-            crop_encoded,
-            soil_encoded,
-            data['Soil_pH'],
-            data['Temperature'],
-            data['Humidity'],
-            data['Wind_Speed'],
-            data['N'],
-            data['P'],
-            data['K'],
-            data['Soil_Quality']
-        ]
-
-        input_df = pd.DataFrame([input_features], columns=[
-            "Crop_Type", "Soil_Type", "Soil_pH", "Temperature", "Humidity",
-            "Wind_Speed", "N", "P", "K", "Soil_Quality"
-        ])
-
-        prediction = model.predict(input_df)[0]
-        return jsonify({'predicted_yield': round(float(prediction), 2)})
-
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-# ------------- Chatbot Endpoint ----------------
 @app.route('/chat', methods=['POST'])
 def chat():
-    try:
-        data = request.json
-        user_input = data.get('message', '')
+    user_id = "default"
+    data = request.get_json()
+    message = data.get("message", "").strip()
 
-        if not user_input:
-            return jsonify({'error': 'Please provide a question.'}), 400
+    if user_id not in user_sessions:
+        user_sessions[user_id] = {"answers": {}, "step": 0, "intro": True}
 
-        if user_input.strip().lower() in ["soil info", "soil content", "initial", "start"]:
-            return jsonify({'reply': initial_info})
+    session = user_sessions[user_id]
 
-        cleaned = preprocess_text(user_input)
-        vector = tfidf_vectorizer.transform([cleaned])
-        prediction = chatbot_model.predict(vector)
+    if session.get("intro"):
+        session["intro"] = False
+        return jsonify({"reply": "👋 Welcome to the Crop Yield Prediction Chatbot!\nAnswer the following questions to predict crop yield.\n\n" + question_flow[0][1]})
 
-        return jsonify({'reply': f"{prediction[0]}"})
+    if session["step"] > 0 and session["step"] <= len(question_flow):
+        key, _ = question_flow[session["step"] - 1]
+        session["answers"][key] = message
 
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    if session["step"] == len(question_flow):
+        try:
+            ans = session["answers"]
 
-# ------------- Image Upload ----------------
-@app.route('/upload', methods=['POST'])
-def upload_image():
-    if 'image' not in request.files:
-        return jsonify({'error': 'No image part'}), 400
-    file = request.files['image']
-    if file.filename == '':
-        return jsonify({'error': 'No file selected'}), 400
-    if file and allowed_file(file.filename):
-        filename = secure_filename(file.filename)
-        path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(path)
-        return jsonify({'message': 'Image uploaded successfully.', 'filepath': path}), 200
-    else:
-        return jsonify({'error': 'Invalid file type'}), 400
+            if ans["Crop_Type"] not in crop_encoder.classes_:
+                session["step"] -= 1
+                return jsonify({"reply": "❌ Unknown crop type. Please re-enter a valid crop name:"})
+            if ans["Soil_Type"] not in soil_encoder.classes_:
+                session["step"] -= 1
+                return jsonify({"reply": "❌ Unknown soil type. Please re-enter a valid soil type:"})
 
-# ------------- Home ----------------
+            crop = crop_encoder.transform([ans["Crop_Type"]])[0]
+            soil = soil_encoder.transform([ans["Soil_Type"]])[0]
+
+            features = [
+                crop, soil,
+                float(ans["Soil_pH"]),
+                float(ans["Temperature"]),
+                float(ans["Humidity"]),
+                float(ans["Wind_Speed"]),
+                float(ans["N"]),
+                float(ans["P"]),
+                float(ans["K"]),
+                float(ans["Soil_Quality"])
+            ]
+
+            input_df = pd.DataFrame([features], columns=[
+                "Crop_Type", "Soil_Type", "Soil_pH", "Temperature", "Humidity",
+                "Wind_Speed", "N", "P", "K", "Soil_Quality"
+            ])
+
+            predicted_yield = model.predict(input_df)[0]
+
+            # Prepare bottom 3 crop predictions for same inputs
+            all_crops = list(crop_encoder.classes_)
+            predictions = []
+            for crop_name in all_crops:
+                try:
+                    encoded_crop = crop_encoder.transform([crop_name])[0]
+                    input_df["Crop_Type"] = encoded_crop
+                    pred = model.predict(input_df)[0]
+                    predictions.append((crop_name, pred))
+                except:
+                    continue
+
+            bottom3 = sorted(predictions, key=lambda x: x[1])[:3]
+            bottom_msg = "\n\nCrops with the Lowest Predicted Yield:\n" + "\n".join(
+                [f"- {name}: {round(val, 2)} tons/ha" for name, val in bottom3])
+
+            final_reply = f"✅ Predicted Crop Yield: {round(predicted_yield, 2)} tons per hectare." + bottom_msg
+
+            user_sessions.pop(user_id)
+            return jsonify({"reply": final_reply})
+
+        except Exception as e:
+            user_sessions.pop(user_id)
+            return jsonify({"reply": f"❌ Error during prediction: {str(e)}"})
+
+    _, next_question = question_flow[session["step"]]
+    session["step"] += 1
+    return jsonify({"reply": next_question})
+
 @app.route('/')
 def home():
-    return "✅ Crop Yield + Chatbot API is running!"
+    return "✅ Crop Yield Chatbot API is running!"
 
-# ------------- Run Server ----------------
 if __name__ == '__main__':
     app.run(debug=True)
